@@ -14,12 +14,14 @@ app = FastAPI(title="SegmentPulse AI Backend", version="2.6")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://data-mining-project-frontend.vercel.app"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "https://data-mining-project-frontend.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 @app.post("/api/cluster")
 async def run_cluster(
     file: UploadFile = File(None),
