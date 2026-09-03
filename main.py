@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
@@ -10,11 +10,11 @@ import io
 import os
 import uvicorn
 
-app = FastAPI()
+app = FastAPI(title="SegmentPulse AI Backend", version="2.6")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "https://data-mining-project-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,8 +27,7 @@ async def run_cluster(
     min_samples: int = Form(8)
 ):
     try:
-        # ১. ফাইল রিড করা (CSV অথবা Excel `.xlsx` / `.xls` হ্যান্ডেল করা)
-        if file is not None:
+        if file is not None and file.filename:
             contents = await file.read()
             filename = file.filename.lower()
             
@@ -36,8 +35,9 @@ async def run_cluster(
                 df = pd.read_excel(io.BytesIO(contents))
             else:
                 df = pd.read_csv(io.BytesIO(contents), encoding="ISO-8859-1")
+            
+            df.columns = df.columns.str.strip()
         else:
-            # যদি ফাইল সিলেক্ট না করা থাকে, ডামি ডেটাসেট তৈরি করা
             np.random.seed(42)
             n = 500
             df = pd.DataFrame({
@@ -47,29 +47,70 @@ async def run_cluster(
                 "UnitPrice": np.random.uniform(5.0, 100.0, n)
             })
 
-        # ২. ডেটাসেট ক্লিন ও RFM মেট্রিক্সে রূপান্তর
-        if "CustomerID" in df.columns and "Quantity" in df.columns and "UnitPrice" in df.columns:
-            df = df.dropna(subset=["CustomerID"])
-            df["CustomerID"] = df["CustomerID"].astype(int)
+        # Flexible column mapping handling variations, spaces, and truncated CSV/Excel headers
+        cols_lower = {c.lower().replace("_", ""): c for c in df.columns}
+        
+        cust_col = (
+            cols_lower.get("customerid") or 
+            cols_lower.get("customer id") or 
+            cols_lower.get("customer")
+        )
+        qty_col = cols_lower.get("quantity")
+        price_col = (
+            cols_lower.get("unitprice") or 
+            cols_lower.get("unit price") or 
+            cols_lower.get("price")
+        )
+        date_col = (
+            cols_lower.get("invoicedate") or 
+            cols_lower.get("invoice date") or 
+            cols_lower.get("invoiceda") or 
+            cols_lower.get("date")
+        )
+        invoice_no_col = (
+            cols_lower.get("invoiceno") or 
+            cols_lower.get("invoice no") or 
+            cols_lower.get("invoice")
+        )
+
+        if cust_col and qty_col and price_col:
+            df = df.dropna(subset=[cust_col])
+            df[cust_col] = pd.to_numeric(df[cust_col], errors="coerce")
+            df = df.dropna(subset=[cust_col])
+            df[cust_col] = df[cust_col].astype(int)
             
-            if "InvoiceDate" in df.columns:
-                df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], errors="coerce")
-                reference_date = df["InvoiceDate"].max() + pd.Timedelta(days=1)
+            if date_col:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                valid_dates = df[date_col].dropna()
+                reference_date = valid_dates.max() + pd.Timedelta(days=1) if not valid_dates.empty else pd.Timestamp("2025-12-31")
             else:
                 reference_date = pd.Timestamp("2025-12-31")
 
-            df["TotalPrice"] = df["Quantity"] * df["UnitPrice"]
+            qty_series = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+            price_series = pd.to_numeric(df[price_col], errors="coerce").fillna(0)
+            df["TotalPrice"] = qty_series * price_series
 
-            # RFM Aggregation
-            rfm = df.groupby("CustomerID").agg({
-                "InvoiceDate": lambda x: (reference_date - x.max()).days,
-                "CustomerID": "count",
+            # RFM Grouping execution
+            freq_col_name = invoice_no_col if invoice_no_col else qty_series.name
+            agg_rules = {
+                freq_col_name: "nunique" if invoice_no_col else "count",
                 "TotalPrice": "sum"
-            }).rename(columns={
-                "InvoiceDate": "Recency",
-                "CustomerID": "Frequency",
-                "TotalPrice": "Monetary"
-            }).reset_index()
+            }
+            if date_col:
+                agg_rules[date_col] = lambda x: (reference_date - x.max()).days if not x.isna().all() else 30
+
+            rfm = df.groupby(cust_col).agg(agg_rules).reset_index()
+            
+            # Rename columns safely based on available keys
+            rename_map = {cust_col: "CustomerID", "TotalPrice": "Monetary"}
+            if date_col:
+                rename_map[date_col] = "Recency"
+                rename_map[freq_col_name] = "Frequency"
+            else:
+                rfm["Recency"] = 30
+                rename_map[freq_col_name] = "Frequency"
+
+            rfm = rfm.rename(columns=rename_map)
         else:
             rfm = pd.DataFrame({
                 "CustomerID": range(17850, 18050),
@@ -78,17 +119,19 @@ async def run_cluster(
                 "Monetary": np.random.uniform(50, 5000, 200)
             })
 
-        # ৩. ফিচার স্কেলিং
+        rfm = rfm.replace([np.inf, -np.inf], np.nan).dropna(subset=["Recency", "Frequency", "Monetary"])
+
+        if len(rfm) < min_samples:
+            raise HTTPException(status_code=400, detail=f"Dataset contains insufficient valid customer records ({len(rfm)}) for min_samples={min_samples}.")
+
         X = rfm[["Recency", "Frequency", "Monetary"]]
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
-        # ৪. ডাইনামিক DBSCAN ট্রেনিং
         dbscan = DBSCAN(eps=eps, min_samples=min_samples)
         clusters = dbscan.fit_predict(X_scaled)
         rfm["Cluster"] = clusters
 
-        # ৫. মেট্রিক্স ক্যালকুলেশন
         total_customers = int(len(rfm))
         clusters_found = int(len(set(clusters)) - (1 if -1 in clusters else 0))
         outliers = int(list(clusters).count(-1))
@@ -102,30 +145,28 @@ async def run_cluster(
         except Exception:
             sil_score = 0.0
 
-        # ৬. PCA (Dimensionality Reduction)
         pca = PCA(n_components=2)
         pca_coords = pca.fit_transform(X_scaled)
         
-        pca_points = []
-        for i in range(len(rfm)):
-            pca_points.append({
+        pca_points = [
+            {
                 "x": float(pca_coords[i, 0]),
                 "y": float(pca_coords[i, 1]),
                 "cluster": int(clusters[i])
-            })
+            }
+            for i in range(len(rfm))
+        ]
 
-        # ৭. টেবিল ডেটা ফরম্যাট
-        table_data = []
-        for i, row in rfm.head(150).iterrows():
-            table_data.append({
+        table_data = [
+            {
                 "CustomerID": int(row["CustomerID"]),
                 "Recency": int(row["Recency"]),
                 "Frequency": int(row["Frequency"]),
                 "Monetary": float(row["Monetary"]),
                 "Cluster": int(row["Cluster"])
-            })
-
-        print(f"Processed -> Customers: {total_customers}, Eps: {eps}, MinSamples: {min_samples}, Clusters: {clusters_found}, Outliers: {outliers}")
+            }
+            for i, row in rfm.head(150).iterrows()
+        ]
 
         return {
             "total_customers": total_customers,
@@ -136,16 +177,11 @@ async def run_cluster(
             "data": table_data
         }
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"Error in clustering: {str(e)}")
-        return {
-            "total_customers": 0,
-            "clusters_found": 0,
-            "outliers": 0,
-            "silhouette_score": 0.0,
-            "pca_points": [],
-            "data": []
-        }
+        print(f"Error in clustering pipeline: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal clustering processing error: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
