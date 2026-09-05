@@ -22,6 +22,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 @app.post("/api/cluster")
 async def run_cluster(
     file: UploadFile = File(None),
